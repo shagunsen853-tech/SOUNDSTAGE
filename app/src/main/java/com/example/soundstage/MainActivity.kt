@@ -1,679 +1,720 @@
 package com.example.soundstage
 
-import android.content.Context
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.bluetooth.*
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
+import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
-class MainActivity : ComponentActivity() {
+@SuppressLint("MissingPermission")
+class MainActivity : Activity() {
+
+    companion object {
+        // IMPORTANT: Replace these placeholders with actual TYTO_APP_SPEC values.
+        val AUDIO_SERVICE_UUID: UUID =
+            UUID.fromString("12345678-1234-5678-1234-56789abcdef0")
+
+        val AUDIO_DATA_CHAR_UUID: UUID =
+            UUID.fromString("12345678-1234-5678-1234-56789abcdef1")
+
+        val CONTROL_CHAR_UUID: UUID =
+            UUID.fromString("12345678-1234-5678-1234-56789abcdef2")
+
+        val CCCD_UUID: UUID =
+            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        // Supports the two names discussed for your test device.
+        // Change this list if your hearing aid advertises another name.
+        val DEVICE_NAME_PREFIXES = listOf("TYTO", "ULCONNECTMAX")
+
+        val START_STREAM_CMD = byteArrayOf(0x01)
+        val STOP_STREAM_CMD = byteArrayOf(0x00)
+
+        const val SAMPLE_RATE = 16000
+        const val CHANNELS = 1
+        const val BITS_PER_SAMPLE = 16
+
+        const val MAX_RETRIES = 3
+        const val PERMISSION_REQUEST = 1
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    private lateinit var root: LinearLayout
+    private lateinit var statusText: TextView
+    private lateinit var statsText: TextView
+
+    private val btAdapter: BluetoothAdapter? by lazy {
+        (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
+    }
+
+    private var gatt: BluetoothGatt? = null
+    private var lastDevice: BluetoothDevice? = null
+    private var userDisconnected = false
+    private var retryCount = 0
+    private var scanning = false
+    private var ready = false
+
+    private var currentScreen = "home"
+
+    // Audio transfer
+    private val audioQueue = LinkedBlockingQueue<ByteArray>()
+    private var audioTrack: AudioTrack? = null
+    private var audioThread: Thread? = null
+
+    @Volatile
+    private var streaming = false
+
+    private var wavFile: File? = null
+    private var wavOut: FileOutputStream? = null
+    private var wavDataBytes = 0L
+
+    @Volatile
+    private var packetCount = 0L
+
+    @Volatile
+    private var bytesThisSecond = 0L
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        showHomeScreen()
+        handler.post(statsUpdater)
+    }
 
-        setContent {
-            SoundstageApp(this)
+    // ---------------- UI HELPERS ----------------
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
+
+    private fun makeText(
+        value: String,
+        size: Float = 16f
+    ): TextView {
+        return TextView(this).apply {
+            text = value
+            textSize = size
+            setTextColor(Color.WHITE)
+            setPadding(dp(4), dp(6), dp(4), dp(6))
         }
     }
-}
 
-@Composable
-fun SoundstageApp(context: Context) {
-
-    val prefs = remember {
-        context.getSharedPreferences("soundstage_prefs", Context.MODE_PRIVATE)
+    private fun makeButton(
+        label: String,
+        action: () -> Unit
+    ): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setOnClickListener { action() }
+        }
     }
 
-    var currentScreen by remember {
-        mutableStateOf("welcome")
+    private fun beginScreen(title: String) {
+        currentScreen = when (title) {
+            "SoundStage" -> "home"
+            "Bluetooth Connection" -> "bluetooth"
+            else -> "audio"
+        }
+
+        root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setBackgroundColor(Color.rgb(22, 24, 38))
+        }
+
+        val scroll = ScrollView(this)
+        scroll.addView(root)
+
+        setContentView(scroll)
+
+        val heading = makeText(title, 27f)
+        heading.gravity = Gravity.CENTER_VERTICAL
+        root.addView(heading)
+
+        root.addView(makeText("SoundStage Hearing Aid App", 14f))
+        root.addView(makeText("Status: ", 16f).also {
+            statusText = it
+        })
+
+        statsText = makeText("", 13f)
     }
 
-    var maria by remember {
-        mutableStateOf(prefs.getBoolean("maria", true))
-    }
-
-    var leah by remember {
-        mutableStateOf(prefs.getBoolean("leah", true))
-    }
-
-    var alex by remember {
-        mutableStateOf(prefs.getBoolean("alex", false))
-    }
-
-    var daniel by remember {
-        mutableStateOf(prefs.getBoolean("daniel", false))
-    }
-
-    fun savePerson(name: String, value: Boolean) {
-        prefs.edit().putBoolean(name, value).apply()
-    }
-
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary = Color(0xFF6C5CE7),
-            background = Color(0xFF101010),
-            surface = Color(0xFF1A1A1A)
+    private fun addButton(
+        label: String,
+        action: () -> Unit
+    ) {
+        root.addView(
+            makeButton(label, action),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8)
+            }
         )
-    ) {
+    }
 
-        when (currentScreen) {
-
-            "welcome" -> {
-                WelcomeScreen(
-                    onGetStarted = {
-                        currentScreen = "pair"
-                    }
-                )
-            }
-
-            "pair" -> {
-                PairScreen(
-                    onContinue = {
-                        currentScreen = "people"
-                    },
-                    onBack = {
-                        currentScreen = "welcome"
-                    }
-                )
-            }
-
-            "people" -> {
-                PeopleScreen(
-                    maria = maria,
-                    leah = leah,
-                    alex = alex,
-                    daniel = daniel,
-
-                    onMaria = {
-                        maria = !maria
-                        savePerson("maria", maria)
-                    },
-
-                    onLeah = {
-                        leah = !leah
-                        savePerson("leah", leah)
-                    },
-
-                    onAlex = {
-                        alex = !alex
-                        savePerson("alex", alex)
-                    },
-
-                    onDaniel = {
-                        daniel = !daniel
-                        savePerson("daniel", daniel)
-                    },
-
-                    onSoundstage = {
-                        currentScreen = "soundstage"
-                    }
-                )
-            }
-
-            "soundstage" -> {
-                SoundstageScreen(
-                    maria = maria,
-                    leah = leah,
-                    alex = alex,
-                    daniel = daniel,
-
-                    onMaria = {
-                        maria = !maria
-                        savePerson("maria", maria)
-                    },
-
-                    onLeah = {
-                        leah = !leah
-                        savePerson("leah", leah)
-                    },
-
-                    onAlex = {
-                        alex = !alex
-                        savePerson("alex", alex)
-                    },
-
-                    onDaniel = {
-                        daniel = !daniel
-                        savePerson("daniel", daniel)
-                    },
-
-                    onPeopleList = {
-                        currentScreen = "people"
-                    }
-                )
+    private fun setStatus(message: String) {
+        runOnUiThread {
+            if (::statusText.isInitialized) {
+                statusText.text = "Status: $message"
             }
         }
     }
-}
 
-@Composable
-fun WelcomeScreen(
-    onGetStarted: () -> Unit
-) {
+    // ---------------- SCREEN 1: SOUNDSTAGE ----------------
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF101010))
-            .padding(28.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+    private fun showHomeScreen() {
+        beginScreen("SoundStage")
 
-        Box(
-            modifier = Modifier
-                .size(110.dp)
-                .background(
-                    Color(0xFF6C5CE7),
-                    CircleShape
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = "S",
-                color = Color.White,
-                fontSize = 48.sp,
-                fontWeight = FontWeight.Bold
+        root.addView(
+            makeText(
+                "Connect your hearing aid and transfer audio.",
+                17f
+            )
+        )
+
+        addButton("Connect Hearing Aid") {
+            showBluetoothScreen()
+            checkPermissionsAndScan()
+        }
+
+        addButton("Open Audio Transfer") {
+            if (ready && gatt != null) {
+                showAudioScreen()
+            } else {
+                setStatus("Connect the hearing aid first")
+            }
+        }
+
+        addButton("Disconnect") {
+            disconnect()
+            showHomeScreen()
+            setStatus("Disconnected")
+        }
+
+        setStatus(
+            if (ready) "Hearing aid ready"
+            else "Not connected"
+        )
+    }
+
+    // ---------------- SCREEN 2: BLUETOOTH ----------------
+
+    private fun showBluetoothScreen() {
+        beginScreen("Bluetooth Connection")
+
+        root.addView(
+            makeText(
+                "Scan for your hearing aid. Keep it powered on and nearby."
+            )
+        )
+
+        addButton("Scan / Connect") {
+            checkPermissionsAndScan()
+        }
+
+        addButton("Stop Scan") {
+            stopScan()
+            setStatus("Scan stopped")
+        }
+
+        addButton("Disconnect") {
+            disconnect()
+        }
+
+        addButton("Back to SoundStage") {
+            showHomeScreen()
+        }
+
+        if (ready) {
+            addButton("Continue to Audio Transfer") {
+                showAudioScreen()
+            }
+        }
+
+        setStatus(
+            if (ready) "Connected and ready"
+            else if (scanning) "Scanning..."
+            else "Ready to scan"
+        )
+    }
+
+    // ---------------- SCREEN 3: AUDIO TRANSFER ----------------
+
+    private fun showAudioScreen() {
+        beginScreen("Audio Transfer")
+
+        root.addView(
+            makeText(
+                "Audio is received through BLE notifications when " +
+                        "the hearing aid supports the configured audio service."
+            )
+        )
+
+        root.addView(statsText)
+
+        addButton("Start Audio") {
+            startStreaming()
+        }
+
+        addButton("Stop Audio") {
+            stopStreaming()
+        }
+
+        addButton("Back to Bluetooth Connection") {
+            showBluetoothScreen()
+        }
+
+        addButton("Disconnect") {
+            disconnect()
+            showBluetoothScreen()
+        }
+
+        setStatus(
+            if (ready) "Connected"
+            else "Not connected"
+        )
+    }
+
+    // ---------------- PERMISSIONS ----------------
+
+    private val requiredPermissions: Array<String>
+        get() =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_CONNECT
+                )
+            } else {
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+
+    private fun checkPermissionsAndScan() {
+        val missing = requiredPermissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isEmpty()) {
+            startScan()
+        } else {
+            requestPermissions(
+                missing.toTypedArray(),
+                PERMISSION_REQUEST
             )
         }
+    }
 
-        Spacer(modifier = Modifier.height(30.dp))
-
-        Text(
-            text = "Welcome to Soundstage",
-            color = Color.White,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(
+            requestCode,
+            permissions,
+            grantResults
         )
 
-        Spacer(modifier = Modifier.height(15.dp))
-
-        Text(
-            text = "Hear the people who matter.",
-            color = Color.LightGray,
-            fontSize = 18.sp,
-            textAlign = TextAlign.Center
-        )
-
-        Spacer(modifier = Modifier.height(45.dp))
-
-        Button(
-            onClick = onGetStarted,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(55.dp),
-            shape = RoundedCornerShape(14.dp)
+        if (
+            requestCode == PERMISSION_REQUEST &&
+            grantResults.isNotEmpty() &&
+            grantResults.all { it == PackageManager.PERMISSION_GRANTED }
         ) {
-            Text(
-                text = "Get Started",
-                fontSize = 18.sp
-            )
+            startScan()
+        } else {
+            setStatus("Bluetooth permission denied")
         }
     }
-}
 
-@Composable
-fun PairScreen(
-    onContinue: () -> Unit,
-    onBack: () -> Unit
-) {
+    // ---------------- BLE SCAN ----------------
 
-    var paired by remember {
-        mutableStateOf(false)
+    private val scanCallback = object : ScanCallback() {
+
+        override fun onScanResult(
+            callbackType: Int,
+            result: ScanResult
+        ) {
+            val deviceName =
+                try {
+                    result.device.name ?: result.scanRecord?.deviceName
+                } catch (_: SecurityException) {
+                    null
+                } ?: return
+
+            val matches = DEVICE_NAME_PREFIXES.any {
+                deviceName.startsWith(it, ignoreCase = true)
+            }
+
+            if (!matches) return
+
+            stopScan()
+
+            setStatus("Found $deviceName. Connecting...")
+            connect(result.device)
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            scanning = false
+            setStatus("Scan failed: $errorCode")
+        }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF101010))
-            .padding(28.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
+    private fun startScan() {
+        val adapter = btAdapter
+            ?: return setStatus("Bluetooth not supported")
 
-        Text(
-            text = "← Back",
-            color = Color.LightGray,
-            modifier = Modifier
-                .align(Alignment.Start)
-                .clickable {
-                    onBack()
+        if (!adapter.isEnabled) {
+            return setStatus("Turn Bluetooth on")
+        }
+
+        if (scanning) return
+
+        userDisconnected = false
+        ready = false
+        retryCount = 0
+        scanning = true
+
+        setStatus("Scanning for hearing aid...")
+
+        try {
+            adapter.bluetoothLeScanner?.startScan(scanCallback)
+                ?: run {
+                    scanning = false
+                    setStatus("BLE scanner unavailable")
+                    return
                 }
-        )
-
-        Spacer(modifier = Modifier.height(80.dp))
-
-        Text(
-            text = "Pair Hearing Aids",
-            color = Color.White,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        Spacer(modifier = Modifier.height(15.dp))
-
-        Text(
-            text = "Connect your hearing aids to continue.",
-            color = Color.Gray,
-            fontSize = 16.sp,
-            textAlign = TextAlign.Center
-        )
-
-        Spacer(modifier = Modifier.height(50.dp))
-
-        Box(
-            modifier = Modifier
-                .size(130.dp)
-                .background(
-                    Color(0xFF1D1D1D),
-                    CircleShape
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = "🎧",
-                fontSize = 55.sp
-            )
+        } catch (e: SecurityException) {
+            scanning = false
+            setStatus("Bluetooth permission error")
+            return
+        } catch (e: Exception) {
+            scanning = false
+            setStatus("Unable to start scan: ${e.message}")
+            return
         }
 
-        Spacer(modifier = Modifier.height(40.dp))
-
-        Button(
-            onClick = {
-                paired = true
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(55.dp)
-        ) {
-            Text(
-                text = if (paired)
-                    "Hearing Aids Paired ✓"
-                else
-                    "Pair Hearing Aids"
-            )
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        if (paired) {
-
-            Button(
-                onClick = onContinue,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(55.dp)
-            ) {
-                Text("Continue")
+        handler.postDelayed({
+            if (scanning) {
+                stopScan()
+                setStatus("Device not found. Check device name and range.")
             }
+        }, 15000)
+    }
+
+    private fun stopScan() {
+        if (!scanning) return
+
+        scanning = false
+
+        try {
+            btAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        } catch (_: Exception) {
+            // Scanner may already be stopped.
+        }
+    }
+
+    // ---------------- BLE CONNECTION ----------------
+
+    private fun connect(device: BluetoothDevice) {
+        lastDevice = device
+        ready = false
+
+        try {
+            gatt?.close()
+            gatt = device.connectGatt(
+                this,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        } catch (e: Exception) {
+            setStatus("Connection failed: ${e.message}")
+        }
+    }
+
+    private fun disconnect() {
+        userDisconnected = true
+        ready = false
+        stopScan()
+        stopStreaming()
+
+        try {
+            gatt?.disconnect()
+        } catch (_: Exception) {
+            gatt?.close()
+            gatt = null
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
-
-        Text(
-            text = "Demo mode • No real Bluetooth connection",
-            color = Color.Gray,
-            fontSize = 12.sp
-        )
+        setStatus("Disconnecting...")
     }
-}
 
-@Composable
-fun PeopleScreen(
-    maria: Boolean,
-    leah: Boolean,
-    alex: Boolean,
-    daniel: Boolean,
-    onMaria: () -> Unit,
-    onLeah: () -> Unit,
-    onAlex: () -> Unit,
-    onDaniel: () -> Unit,
-    onSoundstage: () -> Unit
-) {
+    // ---------------- GATT CALLBACKS ----------------
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF101010))
-            .padding(20.dp)
-    ) {
+    private val gattCallback = object : BluetoothGattCallback() {
 
-        Text(
-            text = "People List",
-            color = Color.White,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Text(
-            text = "Choose who stays in your conversation",
-            color = Color.Gray,
-            fontSize = 15.sp
-        )
-
-        Spacer(modifier = Modifier.height(30.dp))
-
-        PersonRow(
-            name = "Maria",
-            enabled = maria,
-            onToggle = onMaria
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        PersonRow(
-            name = "Leah",
-            enabled = leah,
-            onToggle = onLeah
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        PersonRow(
-            name = "Alex",
-            enabled = alex,
-            onToggle = onAlex
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        PersonRow(
-            name = "Daniel",
-            enabled = daniel,
-            onToggle = onDaniel
-        )
-
-        Spacer(modifier = Modifier.weight(1f))
-
-        Button(
-            onClick = onSoundstage,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(55.dp)
+        override fun onConnectionStateChange(
+            g: BluetoothGatt,
+            status: Int,
+            newState: Int
         ) {
-            Text(
-                text = "Go to Soundstage",
-                fontSize = 17.sp
-            )
-        }
-    }
-}
-
-@Composable
-fun PersonRow(
-    name: String,
-    enabled: Boolean,
-    onToggle: () -> Unit
-) {
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(
-                Color(0xFF1B1B1B),
-                RoundedCornerShape(15.dp)
-            )
-            .padding(18.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-
-        Column {
-
-            Text(
-                text = name,
-                color = Color.White,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            Text(
-                text = if (enabled)
-                    "In your conversation"
-                else
-                    "Muted",
-                color = if (enabled)
-                    Color(0xFF71E5D5)
-                else
-                    Color.Gray,
-                fontSize = 13.sp
-            )
-        }
-
-        Switch(
-            checked = enabled,
-            onCheckedChange = {
-                onToggle()
-            }
-        )
-    }
-}
-
-@Composable
-fun SoundstageScreen(
-    maria: Boolean,
-    leah: Boolean,
-    alex: Boolean,
-    daniel: Boolean,
-    onMaria: () -> Unit,
-    onLeah: () -> Unit,
-    onAlex: () -> Unit,
-    onDaniel: () -> Unit,
-    onPeopleList: () -> Unit
-) {
-
-    val activeCount =
-        listOf(maria, leah, alex, daniel).count { it }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF101010))
-            .padding(20.dp)
-    ) {
-
-        Text(
-            text = "Soundstage",
-            color = Color.White,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        Spacer(modifier = Modifier.height(6.dp))
-
-        Text(
-            text = "$activeCount people in your conversation",
-            color = Color.Gray,
-            fontSize = 14.sp
-        )
-
-        Spacer(modifier = Modifier.height(30.dp))
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            contentAlignment = Alignment.Center
-        ) {
-
-            Box(
-                modifier = Modifier
-                    .size(300.dp)
-                    .background(
-                        Color(0xFF075B50),
-                        CircleShape
-                    )
+            if (
+                status == BluetoothGatt.GATT_SUCCESS &&
+                newState == BluetoothProfile.STATE_CONNECTED
             ) {
+                retryCount = 0
+                setStatus("Connected. Setting up BLE...")
+                g.requestMtu(517)
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                ready = false
+                stopStreaming()
 
-                PersonBubble(
-                    name = "Maria",
-                    active = maria,
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .offset(
-                            x = 35.dp,
-                            y = 50.dp
-                        ),
-                    onClick = onMaria
-                )
+                try {
+                    g.close()
+                } catch (_: Exception) {
+                }
 
-                PersonBubble(
-                    name = "Leah",
-                    active = leah,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .offset(
-                            x = (-35).dp,
-                            y = 50.dp
-                        ),
-                    onClick = onLeah
-                )
+                if (gatt == g) gatt = null
 
-                PersonBubble(
-                    name = "Alex",
-                    active = alex,
-                    modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .offset(x = 15.dp),
-                    onClick = onAlex
-                )
-
-                PersonBubble(
-                    name = "Daniel",
-                    active = daniel,
-                    modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .offset(x = (-15).dp),
-                    onClick = onDaniel
-                )
-
-                Box(
-                    modifier = Modifier
-                        .size(75.dp)
-                        .align(Alignment.BottomCenter)
-                        .offset(y = (-30).dp)
-                        .background(
-                            Color(0xFF6C5CE7),
-                            CircleShape
-                        ),
-                    contentAlignment = Alignment.Center
+                if (
+                    !userDisconnected &&
+                    retryCount < MAX_RETRIES
                 ) {
-
-                    Text(
-                        text = "You",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold
+                    retryCount++
+                    setStatus(
+                        "Disconnected ($status). Retry " +
+                                "$retryCount/$MAX_RETRIES..."
                     )
+
+                    handler.postDelayed({
+                        if (!userDisconnected) {
+                            lastDevice?.let { connect(it) }
+                        }
+                    }, 1500L * retryCount)
+                } else {
+                    setStatus("Disconnected")
                 }
             }
         }
 
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(
-                    Color(0xFF1B1B1B),
-                    RoundedCornerShape(15.dp)
-                )
-                .padding(16.dp)
+        override fun onMtuChanged(
+            g: BluetoothGatt,
+            mtu: Int,
+            status: Int
         ) {
+            setStatus("MTU $mtu. Discovering services...")
 
-            Text(
-                text = "🎤 Maria",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
+            try {
+                g.requestConnectionPriority(
+                    BluetoothGatt.CONNECTION_PRIORITY_HIGH
+                )
 
-            Spacer(modifier = Modifier.height(5.dp))
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    g.setPreferredPhy(
+                        BluetoothDevice.PHY_LE_2M_MASK,
+                        BluetoothDevice.PHY_LE_2M_MASK,
+                        BluetoothDevice.PHY_OPTION_NO_PREFERRED
+                    )
+                }
+            } catch (_: Exception) {
+                // Connection can still continue without these optimizations.
+            }
 
-            Text(
-                text = "\"...grab the table by the window?\"",
-                color = Color.LightGray
-            )
+            g.discoverServices()
         }
 
-        Spacer(modifier = Modifier.height(15.dp))
+        override fun onServicesDiscovered(
+            g: BluetoothGatt,
+            status: Int
+        ) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                setStatus("Service discovery failed: $status")
+                return
+            }
 
-        Text(
-            text = "Tap a person to keep or mute",
-            color = Color.Gray,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-            fontSize = 13.sp
+            val service = g.getService(AUDIO_SERVICE_UUID)
+            val characteristic =
+                service?.getCharacteristic(AUDIO_DATA_CHAR_UUID)
+
+            if (characteristic == null) {
+                ready = false
+                setStatus(
+                    "Audio characteristic not found. " +
+                            "Verify service and characteristic UUIDs."
+                )
+                return
+            }
+
+            enableNotifications(g, characteristic)
+        }
+
+        override fun onDescriptorWrite(
+            g: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (
+                descriptor.uuid == CCCD_UUID &&
+                status == BluetoothGatt.GATT_SUCCESS
+            ) {
+                ready = true
+                setStatus("BLE ready. Open Audio Transfer.")
+
+                runOnUiThread {
+                    if (currentScreen == "bluetooth") {
+                        showBluetoothScreen()
+                    }
+                }
+            } else {
+                ready = false
+                setStatus("Notification setup failed: $status")
+            }
+        }
+
+        // Android 13 and newer
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == AUDIO_DATA_CHAR_UUID) {
+                handleAudioPacket(value)
+            }
+        }
+
+        // Android 12 and older
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            if (
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU &&
+                characteristic.uuid == AUDIO_DATA_CHAR_UUID
+            ) {
+                @Suppress("DEPRECATION")
+                handleAudioPacket(characteristic.value.copyOf())
+            }
+        }
+    }
+
+    private fun enableNotifications(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ) {
+        val enabled = g.setCharacteristicNotification(
+            characteristic,
+            true
         )
 
-        Spacer(modifier = Modifier.height(15.dp))
+        if (!enabled) {
+            setStatus("Could not enable notifications")
+            return
+        }
 
-        Button(
-            onClick = onPeopleList,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(55.dp)
-        ) {
-            Text(
-                text = "Back to People List"
+        val descriptor = characteristic.getDescriptor(CCCD_UUID)
+
+        if (descriptor == null) {
+            setStatus("CCCD descriptor missing")
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val result = g.writeDescriptor(
+                descriptor,
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             )
+
+            if (result != BluetoothStatusCodes.SUCCESS) {
+                setStatus("Could not write notification descriptor")
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            descriptor.value =
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+
+            @Suppress("DEPRECATION")
+            val started = g.writeDescriptor(descriptor)
+
+            if (!started) {
+                setStatus("Could not write notification descriptor")
+            }
         }
     }
-}
 
-@Composable
-fun PersonBubble(
-    name: String,
-    active: Boolean,
-    modifier: Modifier,
-    onClick: () -> Unit
-) {
+    private fun writeControl(command: ByteArray) {
+        val currentGatt = gatt ?: return
 
-    Column(
-        modifier = modifier
-            .clickable {
-                onClick()
-            },
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
+        val characteristic = currentGatt
+            .getService(AUDIO_SERVICE_UUID)
+            ?.getCharacteristic(CONTROL_CHAR_UUID)
+            ?: run {
+                setStatus("Control characteristic not found")
+                return
+            }
 
-        Box(
-            modifier = Modifier
-                .size(62.dp)
-                .background(
-                    if (active)
-                        Color(0xFF0B7A69)
-                    else
-                        Color.DarkGray,
-                    CircleShape
-                ),
-            contentAlignment = Alignment.Center
-        ) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val result = currentGatt.writeCharacteristic(
+                    characteristic,
+                    command,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                )
 
-            Text(
-                text = name,
-                color = Color.White,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
+                if (result != BluetoothStatusCodes.SUCCESS) {
+                    setStatus("Control command failed: $result")
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = command
 
-        if (!active) {
-            Text(
-                text = "Muted",
-                color = Color.Gray,
-                fontSize = 11.sp
-            )
+                characteristic.writeType =
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+                @Suppress("DEPRECATION")
+                val started =
+                    currentGatt.writeCharacteristic(characteristic)
+
+                if (!started) {
+                    setStatus("Control command could not start")
+                }
+            }
+        } catch (e: Exception) {
+            setStatus("Control write error: ${e.message}")
         }
     }
-}
+
+    // ---------------- AUDIO RECEIVE ----------------
+
+    private fun handleAudioPacket(data: ByteArray) {
+        if (!streaming || data.isEmpty()) return
+
+        packetCount++
+        bytesThisSecond += data.size
+
+        audioQueue.offer(data)
+    }
+
+    privat
