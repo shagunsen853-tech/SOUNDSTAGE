@@ -28,6 +28,13 @@
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
 
+    <!-- Needed so the app can use the phone's speech-to-text (Android 11+) -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:label="SoundStage"
