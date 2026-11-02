@@ -539,7 +539,7 @@ class MainActivity : Activity() {
         updateTranscriptText(null)
     }
 
-    private val speechListener: RecognitionListener = object : RecognitionListener {
+    private val speechListener: RecognitionListener git= object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {}
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(rmsdB: Float) {}
